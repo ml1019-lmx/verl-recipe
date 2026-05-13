@@ -2,29 +2,16 @@
 
 from __future__ import annotations
 
-import os
-import uuid
 from collections import defaultdict
-from copy import deepcopy
-from pprint import pprint
+from contextlib import contextmanager
 
 import numpy as np
 import torch
 from recipe.dapo.dapo_ray_trainer import RayDAPOTrainer
-from tqdm import tqdm
 
 from verl import DataProto
-from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics
-from verl.trainer.ppo.ray_trainer import (
-    AdvantageEstimator,
-    apply_kl_penalty,
-    compute_advantage,
-)
-from verl.trainer.ppo.reward import extract_reward
-from verl.utils.checkpoint.checkpoint_manager import should_save_ckpt_esi
 from verl.utils.metric import reduce_metrics
 from verl.utils.profiler import marked_timer
-from verl.utils.rollout_skip import RolloutSkip
 
 from .predictor_utils import snake_sort_indices
 
@@ -280,7 +267,7 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
             return np.asarray(keys, dtype=object)
         raise ValueError("Cannot restore order: neither `uid` nor `extra_info.index` found in non_tensor_batch")
 
-    def _maybe_update_predictor(self, gen_batch: DataProto, batch: DataProto, metrics, timing_raw):
+    def _maybe_update_predictor(self, batch: DataProto, timing_raw):
         with marked_timer("update_predictor", timing_raw, "orange"):
             prompt_length = batch.batch["prompts"].shape[-1]
             prompt_input_ids = batch.batch["prompts"]
@@ -297,397 +284,73 @@ class PredictorRayDAPOTrainer(RayDAPOTrainer):
             )
 
             predictor_output = self.actor_rollout_wg.update_predictor(prompt_batch, batch)
-        metrics.update(reduce_metrics(predictor_output.meta_info.get("metrics", {})))
+        return reduce_metrics(predictor_output.meta_info.get("metrics", {}))
+
+    @staticmethod
+    def _invert_reorder_indices(order: torch.Tensor) -> torch.Tensor:
+        reverse_order = torch.empty_like(order)
+        reverse_order[order] = torch.arange(len(order), dtype=order.dtype, device=order.device)
+        return reverse_order
+
+    @contextmanager
+    def _predictor_runtime_hooks(self):
+        """Temporarily inject predictor logic into the inherited DAPO fit loop."""
+        orig_generate_sequences = self.async_rollout_manager.generate_sequences
+        orig_balance_batch = self._balance_batch
+        orig_update_actor = self._update_actor
+        self._predictor_balance_reverse_idx = None
+
+        def wrapped_generate_sequences(gen_batch_output):
+            is_baseline = gen_batch_output.meta_info.get("do_sample") is False
+            if is_baseline:
+                return orig_generate_sequences(gen_batch_output)
+
+            predictor_timing = {}
+            with marked_timer("predictor_score", predictor_timing, "purple"):
+                with marked_timer("predictor_hydrate", predictor_timing, "purple"):
+                    predictor_input_batch = gen_batch_output.select(deepcopy=True)
+                    predictor_input_batch = self._hydrate_gen_batch_model_inputs(predictor_input_batch)
+                predictor_order = self._build_predictor_order(predictor_input_batch)
+                reverse_order = self._invert_reorder_indices(predictor_order)
+                self._apply_predictor_order(gen_batch_output, predictor_order)
+
+            output = orig_generate_sequences(gen_batch_output)
+            self._apply_predictor_order(output, reverse_order)
+            output.meta_info.setdefault("timing", {}).update(predictor_timing)
+            return output
+
+        def wrapped_balance_batch(batch, metrics, **kwargs):
+            uid_before_balance = batch.non_tensor_batch["uid"].copy()
+            result = orig_balance_batch(batch, metrics=metrics, **kwargs)
+            self._predictor_balance_reverse_idx = self._build_reverse_idx_from_uid(
+                uid_before_balance,
+                batch.non_tensor_batch["uid"],
+            )
+            return result
+
+        def wrapped_update_actor(batch):
+            actor_output = orig_update_actor(batch)
+            reverse_idx = self._predictor_balance_reverse_idx
+            self._predictor_balance_reverse_idx = None
+            if reverse_idx is not None:
+                batch.reorder(reverse_idx)
+            predictor_metrics = self._maybe_update_predictor(batch, {})
+            actor_output.meta_info.setdefault("metrics", {}).update(predictor_metrics)
+            return actor_output
+
+        self.async_rollout_manager.generate_sequences = wrapped_generate_sequences
+        self._balance_batch = wrapped_balance_batch
+        self._update_actor = wrapped_update_actor
+        try:
+            yield
+        finally:
+            self.async_rollout_manager.generate_sequences = orig_generate_sequences
+            self._balance_batch = orig_balance_batch
+            self._update_actor = orig_update_actor
+            self._predictor_balance_reverse_idx = None
 
     def fit(self):
-        """
-        The training loop of PPO.
-        The driver process only need to call the compute functions of the worker group through RPC
-        to construct the PPO dataflow.
-        The light-weight advantage computation is done on the driver process.
-        """
         if not self._predictor_enabled():
             return super().fit()
-        from omegaconf import OmegaConf
-
-        from verl.utils.tracking import Tracking
-
-        logger = Tracking(
-            project_name=self.config.trainer.project_name,
-            experiment_name=self.config.trainer.experiment_name,
-            default_backend=self.config.trainer.logger,
-            config=OmegaConf.to_container(self.config, resolve=True),
-        )
-
-        self.global_steps = 0
-        self.gen_steps = 0
-        self.max_steps_duration = 0
-
-        # load checkpoint before doing anything
-        self._load_checkpoint()
-        self.checkpoint_manager.update_weights()
-
-        # perform validation before training
-        # currently, we only support validation using the reward_function.
-        if self.config.trainer.get("val_before_train", True):
-            val_metrics = self._validate()
-            assert val_metrics, f"{val_metrics=}"
-            pprint(f"Initial validation metrics: {val_metrics}")
-            logger.log(data=val_metrics, step=self.global_steps)
-            if self.config.trainer.get("val_only", False):
-                return
-
-        if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
-            rollout_skip = RolloutSkip(self.config, self.async_rollout_manager)
-            rollout_skip.wrap_generate_sequences()
-
-        # add tqdm
-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
-
-        # we start from step 1
-        self.global_steps += 1
-        self.gen_steps += 1
-        last_val_metrics = None
-
-        prev_step_profile = False
-        curr_step_profile = (
-            self.global_steps in self.config.global_profiler.steps
-            if self.config.global_profiler.steps is not None
-            else False
-        )
-        next_step_profile = False
-
-        timing_raw = defaultdict(float)
-        batch = None
-        num_prompt_in_batch = 0
-        num_gen_batches = 0
-        current_epoch = self.global_steps // len(self.train_dataloader)
-
-        for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
-                if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
-                    self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
-                metrics = {}
-
-                with marked_timer("start_profile", timing_raw):
-                    self._start_profiling(
-                        not prev_step_profile and curr_step_profile
-                        if self.config.global_profiler.profile_continuous_steps
-                        else curr_step_profile
-                    )
-
-                new_batch: DataProto = DataProto.from_single_dict(batch_dict)
-                new_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-                num_gen_batches += 1
-                # print(f"new_batch{new_batch}")
-                gen_batch = self._get_gen_batch(new_batch)
-                # print(f"gen_batch{gen_batch}")
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                )
-
-                is_last_step = self.global_steps >= self.total_training_steps
-
-                with marked_timer("step", timing_raw):
-                    with marked_timer("predictor_score", timing_raw, "purple"):
-                        with marked_timer("predictor_hydrate", timing_raw, "purple"):
-                            predictor_input_batch = gen_batch_output.select(deepcopy=True)
-                            predictor_input_batch = self._hydrate_gen_batch_model_inputs(predictor_input_batch)
-                        predictor_order = self._build_predictor_order(predictor_input_batch)
-                        # predictor_scores = self.actor_rollout_wg.compute_predictor_score(predictor_input_batch)
-                        self._apply_predictor_order(gen_batch_output, predictor_order)
-                        # print(f'predictor_scores{predictor_scores}')
-                    # generate a batch
-                    with marked_timer("gen", timing_raw, "red"):
-                        # print(f'gen_batch_output{gen_batch_output}')
-                        gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
-
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        with marked_timer("gen_max", timing_raw, "red"):
-                            gen_baseline_batch = deepcopy(gen_batch)
-                            gen_baseline_batch.meta_info["do_sample"] = False
-                            gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
-
-                            new_batch = new_batch.union(gen_baseline_output)
-                            # compute reward model score on new_batch
-                            rm_scores = None
-                            if self.use_rm and "rm_scores" not in new_batch.batch.keys():
-                                rm_scores = self._compute_reward_colocate(new_batch)
-                                new_batch = new_batch.union(rm_scores)
-                            reward_baseline_tensor, _ = extract_reward(new_batch)
-                            reward_baseline_tensor = reward_baseline_tensor.sum(dim=-1)
-
-                            keys_to_pop = set(gen_baseline_output.batch.keys())
-                            if rm_scores is not None:
-                                keys_to_pop.update(rm_scores.batch.keys())
-                            new_batch.pop(batch_keys=list(keys_to_pop))
-
-                            new_batch.batch["reward_baselines"] = reward_baseline_tensor
-
-                            del rm_scores, gen_baseline_batch, gen_baseline_output
-
-                    new_batch.non_tensor_batch["uid"] = np.array(
-                        [str(uuid.uuid4()) for _ in range(len(new_batch.batch))], dtype=object
-                    )
-                    # repeat to align with repeated responses in rollout
-                    new_batch = new_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    new_batch = new_batch.union(gen_batch_output)
-
-                    if self.config.algorithm.use_kl_in_reward:
-                        # We need these metrics for apply_kl_penalty if using kl in reward
-                        new_batch = self.compute_kl_related_metrics(new_batch, metrics, timing_raw)
-                        # otherwise, we will compute those after dynamic sampling
-
-                    with marked_timer("reward", timing_raw, "yellow"):
-                        # compute scores. Support both model and function-based.
-                        # We first compute the scores using reward model. Then, we call reward_fn to combine
-                        # the results from reward model and rule-based results.
-                        if self.use_rm and "rm_scores" not in new_batch.batch.keys():
-                            # we first compute reward model score
-                            batch_reward = self._compute_reward_colocate(new_batch)
-                            new_batch = new_batch.union(batch_reward)
-
-                        # we combine with rule-based rm
-                        reward_tensor, reward_extra_infos_dict = extract_reward(new_batch)
-
-                        new_batch.batch["token_level_scores"] = reward_tensor
-
-                        if reward_extra_infos_dict:
-                            new_batch.non_tensor_batch.update(
-                                {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
-                            )
-
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            new_batch, kl_metrics = apply_kl_penalty(
-                                new_batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
-                            )
-                            metrics.update(
-                                kl_metrics
-                            )  # TODO: This will be cleared if we use multiple genenration batches
-                        else:
-                            new_batch.batch["token_level_rewards"] = new_batch.batch["token_level_scores"]
-
-                    if not self.config.algorithm.filter_groups.enable:
-                        batch = new_batch
-                    else:  # NOTE: When prompts after filtering is less than train batch size,
-                        # we skip to the next generation batch
-                        metric_name = self.config.algorithm.filter_groups.metric
-                        if metric_name == "seq_final_reward":
-                            # Turn to numpy for easier filtering
-                            new_batch.non_tensor_batch["seq_final_reward"] = (
-                                new_batch.batch["token_level_rewards"].sum(dim=-1).numpy()
-                            )
-                        elif metric_name == "seq_reward":
-                            new_batch.non_tensor_batch["seq_reward"] = (
-                                new_batch.batch["token_level_scores"].sum(dim=-1).numpy()
-                            )
-
-                        # Collect the sequence reward for each trajectory
-                        prompt_uid2metric_vals = defaultdict(list)
-                        for uid, metric_val in zip(
-                            new_batch.non_tensor_batch["uid"], new_batch.non_tensor_batch[metric_name], strict=True
-                        ):
-                            prompt_uid2metric_vals[uid].append(metric_val)
-
-                        prompt_uid2metric_std = {}
-                        for prompt_uid, metric_vals in prompt_uid2metric_vals.items():
-                            prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
-
-                        kept_prompt_uids = [
-                            uid
-                            for uid, std in prompt_uid2metric_std.items()
-                            if std > 0 or len(prompt_uid2metric_vals[uid]) == 1
-                        ]
-                        num_prompt_in_batch += len(kept_prompt_uids)
-
-                        kept_traj_idxs = []
-                        for idx, traj_from_prompt_uid in enumerate(new_batch.non_tensor_batch["uid"]):
-                            if traj_from_prompt_uid in kept_prompt_uids:
-                                kept_traj_idxs.append(idx)
-
-                        new_batch = new_batch[kept_traj_idxs]
-                        batch = new_batch if batch is None else DataProto.concat([batch, new_batch])
-
-                        prompt_bsz = self.config.data.train_batch_size
-                        if num_prompt_in_batch < prompt_bsz:
-                            print(f"{num_prompt_in_batch=} < {prompt_bsz=}")
-                            max_num_gen_batches = self.config.algorithm.filter_groups.max_num_gen_batches
-                            if max_num_gen_batches <= 0 or num_gen_batches < max_num_gen_batches:
-                                print(f"{num_gen_batches=}. Keep generating...")
-                                self.gen_steps += 1
-                                is_last_step = self.global_steps >= self.total_training_steps
-                                continue
-                            else:
-                                raise ValueError(
-                                    f"{num_gen_batches=} >= {max_num_gen_batches=}."
-                                    + " Generated too many. Please check if your data are too difficult."
-                                    + " You could also try set max_num_gen_batches=0 to enable endless trials."
-                                )
-                        else:
-                            # Align the batch
-                            traj_bsz = self.config.data.train_batch_size * self.config.actor_rollout_ref.rollout.n
-                            batch = batch[:traj_bsz]
-
-                    self.checkpoint_manager.sleep_replicas()
-
-                    # === Updating ===
-                    # Balance the number of valid tokens across DP ranks.
-                    # NOTE: This usually changes the order of data in the `batch`,
-                    # which won't affect the advantage calculation (since it's based on uid),
-                    # but might affect the loss calculation (due to the change of mini-batching).
-                    # TODO: Decouple the DP balancing and mini-batching.
-                    # print(f'self.config.trainer.balance_batch{self.config.trainer.balance_batch}')
-                    # if self.config.trainer.balance_batch:
-                    #     self._balance_batch(batch, metrics=metrics)
-
-                    if self.config.trainer.balance_batch:
-                        uid_before_balance = batch.non_tensor_batch["uid"].copy()
-                        self._balance_batch(batch, metrics=metrics)
-                        reverse_idx = self._build_reverse_idx_from_uid(
-                            uid_before_balance,
-                            batch.non_tensor_batch["uid"],
-                        )
-                    else:
-                        reverse_idx = None
-                    # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
-
-                    if not self.config.algorithm.use_kl_in_reward:
-                        batch = self.compute_kl_related_metrics(batch, metrics, timing_raw)
-
-                    # compute values
-                    if self.use_critic:
-                        with marked_timer("values", timing_raw, "cyan"):
-                            values = self._compute_values(batch)
-                            batch = batch.union(values)
-
-                    # Compute rollout correction weights and off-policy metrics (inherited from RayPPOTrainer)
-                    from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
-
-                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-                    if rollout_corr_config is not None and "rollout_log_probs" in batch.batch:
-                        batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
-                        # IS and off-policy metrics already have rollout_corr/ prefix
-                        metrics.update(is_metrics)
-
-                    with marked_timer("adv", timing_raw, "brown"):
-                        # compute advantages, executed on the driver process
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            config=self.config.algorithm,
-                        )
-
-                    # update critic
-                    if self.use_critic:
-                        with marked_timer("update_critic", timing_raw, "pink"):
-                            critic_output = self._update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
-
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with marked_timer("update_actor", timing_raw, "red"):
-                            actor_output = self._update_actor(batch)
-
-                        # Update predictor after actor update
-                        if reverse_idx is not None:
-                            batch.reorder(reverse_idx)
-                        self._maybe_update_predictor(gen_batch, batch, metrics, timing_raw)
-
-                        # Check if ESI/training plan is close to expiration
-                        esi_close_to_expiration = should_save_ckpt_esi(
-                            max_steps_duration=self.max_steps_duration,
-                            redundant_time=self.config.trainer.esi_redundant_time,
-                        )
-                        if self.config.trainer.save_freq > 0 and (
-                            is_last_step
-                            or self.global_steps % self.config.trainer.save_freq == 0
-                            or esi_close_to_expiration
-                        ):
-                            if esi_close_to_expiration:
-                                print("Force saving checkpoint: ESI instance expiration approaching.")
-                            with marked_timer("save_checkpoint", timing_raw, "green"):
-                                self._save_checkpoint()
-
-                        with marked_timer("update_weights", timing_raw, "red"):
-                            self.checkpoint_manager.update_weights()
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
-
-                    # Log rollout generations if enabled
-                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
-                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
-
-                # validate
-                if self.config.trainer.test_freq > 0 and (
-                    is_last_step or self.global_steps % self.config.trainer.test_freq == 0
-                ):
-                    with marked_timer("testing", timing_raw, "green"):
-                        val_metrics: dict = self._validate()
-                        if is_last_step:
-                            last_val_metrics = val_metrics
-                    metrics.update(val_metrics)
-
-                with marked_timer("stop_profile", timing_raw):
-                    next_step_profile = (
-                        self.global_steps + 1 in self.config.global_profiler.steps
-                        if self.config.global_profiler.steps is not None
-                        else False
-                    )
-                    self._stop_profiling(
-                        curr_step_profile and not next_step_profile
-                        if self.config.global_profiler.profile_continuous_steps
-                        else curr_step_profile
-                    )
-                    prev_step_profile = curr_step_profile
-                    curr_step_profile = next_step_profile
-
-                steps_duration = timing_raw.get("step", 0)
-                self.max_steps_duration = max(self.max_steps_duration, steps_duration)
-
-                # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                # TODO: implement actual tflpo and theoretical tflpo
-                n_gpus = self.resource_pool_manager.get_n_gpus()
-                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
-                timing_raw = defaultdict(float)  # clear timing
-
-                metrics["train/num_gen_batches"] = num_gen_batches
-                batch = None
-                num_prompt_in_batch = 0
-                num_gen_batches = 0
-
-                # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
-
-                if is_last_step:
-                    if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
-                        self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
-                    pprint(f"Final validation metrics: {last_val_metrics}")
-                    progress_bar.close()
-                    return
-
-                progress_bar.update(1)
-                self.global_steps += 1
-                self.gen_steps += 1
-        # check if last step checkpint exists
-        checkpoint_dir = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
-        if not os.path.exists(checkpoint_dir):
-            # save last step checkpoint
-            timing_raw = defaultdict(float)
-            with marked_timer("save_checkpoint", timing_raw, "green"):
-                self._save_checkpoint()
-            metrics = {f"timing/{k}": v for k, v in timing_raw.items()}
-            logger.log(data=metrics, step=self.global_steps)
+        with self._predictor_runtime_hooks():
+            return super().fit()
